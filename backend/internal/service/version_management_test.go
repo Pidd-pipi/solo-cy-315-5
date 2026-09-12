@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -36,25 +37,46 @@ var suiteSeq atomic.Int64
 
 // versionSuite 持有一个完全隔离的内存数据库与全套仓储/服务。
 type versionSuite struct {
-	t      *testing.T
-	ctx    context.Context
-	db     *gorm.DB
-	svc    service.VersionService
-	slotID uint
-	roomID uint
-	t1     uint
-	t2     uint
-	class  *model.Class
-	course *model.Course
+	t          *testing.T
+	ctx        context.Context
+	db         *gorm.DB
+	dsn        string
+	fileBacked bool
+	svc        service.VersionService
+	slotID     uint
+	roomID     uint
+	t1         uint
+	t2         uint
+	class      *model.Class
+	course     *model.Course
 }
 
 func newVersionSuite(t *testing.T) *versionSuite {
 	t.Helper()
-	// 每个套件实例使用独立命名内存库（多连接共享）。进程内自增序号确保同一
-	// 测试在循环中重复调用时拿到的也是全新数据库，而不是 cache=shared 复用。
+	return newVersionSuiteFile(t, false)
+}
+
+// newVersionSuiteFile builds an isolated suite. With fileBacked=true it uses a
+// temporary file-backed SQLite DB (production WAL + busy_timeout behavior),
+// letting a blocked writer wait for the write lock and commit strictly after
+// the publish/rollback transaction instead of failing with SQLITE_LOCKED as
+// it does on a shared-cache in-memory DB.
+func newVersionSuiteFile(t *testing.T, fileBacked bool) *versionSuite {
+	t.Helper()
 	seq := suiteSeq.Add(1)
-	dsn := fmt.Sprintf("file:vm_%s_%d?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"), seq)
-	db, err := openSuiteDB(dsn)
+	var dsn string
+	var db *gorm.DB
+	var err error
+	if fileBacked {
+		dsn = filepath.Join(t.TempDir(), fmt.Sprintf("vm_%d.db", seq))
+		db, err = database.Open(dsn)
+	} else {
+		// 每个套件实例使用独立命名内存库（多连接共享）。进程内自增序号确保同一
+		// 测试在循环中重复调用时拿到的也是全新数据库，而不是 cache=shared 复用。
+		memName := fmt.Sprintf("file:vm_%s_%d?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"), seq)
+		dsn = memName
+		db, err = openSuiteDB(memName)
+	}
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -66,7 +88,7 @@ func newVersionSuite(t *testing.T) *versionSuite {
 		t.Fatalf("migrate db: %v", err)
 	}
 
-	s := &versionSuite{t: t, ctx: context.Background(), db: db}
+	s := &versionSuite{t: t, ctx: context.Background(), db: db, dsn: dsn, fileBacked: fileBacked}
 	slot := &model.TimeSlot{Code: "S1", Name: "第一节", StartTime: "08:00", EndTime: "08:45"}
 	room := &model.Classroom{Code: "R301", Name: "301教室", Capacity: 50}
 	teacher1 := &model.Teacher{Name: "张老师", EmployeeNo: "T001", Subjects: []string{"数学"}}
@@ -88,9 +110,27 @@ func newVersionSuite(t *testing.T) *versionSuite {
 	slotRepo := repository.NewTimeSlotRepository(db)
 	scheduleRepo := repository.NewScheduleRepository(db)
 	planRepo := repository.NewPlanRepository(db)
-	planner := service.NewPlanner(roomRepo, teacherRepo, classRepo, courseRepo, slotRepo)
+	planner := service.NewPlanner(s.db, roomRepo, teacherRepo, classRepo, courseRepo, slotRepo)
 	s.svc = service.NewVersionService(planRepo, scheduleRepo, planner, logger)
 	return s
+}
+
+// extraConn opens another connection to the same suite database.
+func (s *versionSuite) extraConn() *gorm.DB {
+	s.t.Helper()
+	var (
+		db  *gorm.DB
+		err error
+	)
+	if s.fileBacked {
+		db, err = database.Open(s.dsn)
+	} else {
+		db, err = openSuiteDB(s.dsn)
+	}
+	if err != nil {
+		s.t.Fatalf("open extra connection: %v", err)
+	}
+	return db
 }
 
 func (s *versionSuite) createPlan(name string) *dto.PlanResponse {

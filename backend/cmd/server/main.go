@@ -126,8 +126,8 @@ func newApp(db *gorm.DB, logger *slog.Logger) (*gin.Engine, error) {
 	classService := service.NewClassService(classRepo, logger)
 	courseService := service.NewCourseService(courseRepo, logger)
 	timeSlotService := service.NewTimeSlotService(timeSlotRepo, logger)
-	scheduleService := service.NewScheduleService(scheduleRepo, classroomRepo, teacherRepo, classRepo, courseRepo, timeSlotRepo, adjustmentRepo, logger)
-	planner := service.NewPlanner(classroomRepo, teacherRepo, classRepo, courseRepo, timeSlotRepo)
+	scheduleService := service.NewScheduleService(db, scheduleRepo, classroomRepo, teacherRepo, classRepo, courseRepo, timeSlotRepo, adjustmentRepo, logger)
+	planner := service.NewPlanner(db, classroomRepo, teacherRepo, classRepo, courseRepo, timeSlotRepo)
 	versionService := service.NewVersionService(planRepo, scheduleRepo, planner, logger)
 
 	h := router.Handlers{

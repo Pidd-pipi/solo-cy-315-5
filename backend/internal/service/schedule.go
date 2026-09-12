@@ -12,6 +12,7 @@ import (
 	"github.com/gbschedule/gbschedule/internal/dto"
 	"github.com/gbschedule/gbschedule/internal/model"
 	"github.com/gbschedule/gbschedule/internal/repository"
+	"gorm.io/gorm"
 )
 
 // ScheduleService exposes scheduling, conflict detection, adjustment and statistics operations.
@@ -42,6 +43,7 @@ type scheduleService struct {
 
 // NewScheduleService constructs a schedule service.
 func NewScheduleService(
+	db *gorm.DB,
 	schedules repository.ScheduleRepository,
 	classrooms repository.ClassroomRepository,
 	teachers repository.TeacherRepository,
@@ -59,7 +61,7 @@ func NewScheduleService(
 		courses:     courses,
 		timeSlots:   timeSlots,
 		adjustments: adjustments,
-		planner:     NewPlanner(classrooms, teachers, classes, courses, timeSlots),
+		planner:     NewPlanner(db, classrooms, teachers, classes, courses, timeSlots),
 		logger:      logger,
 	}
 }

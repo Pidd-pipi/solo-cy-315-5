@@ -8,6 +8,7 @@ import (
 	"github.com/gbschedule/gbschedule/internal/dto"
 	"github.com/gbschedule/gbschedule/internal/model"
 	"github.com/gbschedule/gbschedule/internal/repository"
+	"gorm.io/gorm"
 )
 
 // Planner runs the greedy scheduling algorithm and conflict detection
@@ -22,33 +23,58 @@ type Planner interface {
 	// Master-data lookup failures are returned as errors: callers must treat
 	// them as internal failures, never as "no conflict" or "reference missing".
 	DetectConflicts(ctx context.Context, items []model.Schedule) ([]dto.ConflictResponse, error)
+	// DetectConflictsTx is the transaction-scoped variant: master data is read
+	// through tx, so a publish/rollback can re-validate inside the same write
+	// transaction that applies the timetable, closing the check-then-act race.
+	DetectConflictsTx(ctx context.Context, tx *gorm.DB, items []model.Schedule) ([]dto.ConflictResponse, error)
 	// Enrich fills related names for timetable entries.
 	Enrich(ctx context.Context, items []model.Schedule) ([]dto.ScheduleResponse, error)
 }
 
 type planner struct {
+	db         *gorm.DB
 	classrooms repository.ClassroomRepository
 	teachers   repository.TeacherRepository
 	classes    repository.ClassRepository
 	courses    repository.CourseRepository
 	timeSlots  repository.TimeSlotRepository
+	loader     MasterDataLoader
 }
 
-// NewPlanner constructs the in-memory scheduling planner.
+// Option customizes a planner, used mainly to inject a faulty/blocking
+// master-data loader in tests.
+type Option func(*planner)
+
+// WithMasterDataLoader overrides the default GORM-backed master-data loader.
+func WithMasterDataLoader(loader MasterDataLoader) Option {
+	return func(p *planner) { p.loader = loader }
+}
+
+// NewPlanner constructs the in-memory scheduling planner. db is used for
+// transaction-scoped conflict detection; the repositories serve planning and
+// enrichment outside transactions.
 func NewPlanner(
+	db *gorm.DB,
 	classrooms repository.ClassroomRepository,
 	teachers repository.TeacherRepository,
 	classes repository.ClassRepository,
 	courses repository.CourseRepository,
 	timeSlots repository.TimeSlotRepository,
+	opts ...Option,
 ) Planner {
-	return &planner{
+	p := &planner{
+		db:         db,
 		classrooms: classrooms,
 		teachers:   teachers,
 		classes:    classes,
 		courses:    courses,
 		timeSlots:  timeSlots,
+		loader:     gormMasterDataLoader{},
 	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
 }
 
 // Plan runs the greedy scheduling algorithm without persisting anything.
@@ -245,37 +271,48 @@ func (p *planner) resolveClassrooms(ctx context.Context, req *dto.GenerateSchedu
 	return items, nil
 }
 
+func (p *planner) DetectConflicts(ctx context.Context, items []model.Schedule) ([]dto.ConflictResponse, error) {
+	return p.detectConflicts(ctx, p.db.WithContext(ctx), items)
+}
+
+func (p *planner) DetectConflictsTx(ctx context.Context, tx *gorm.DB, items []model.Schedule) ([]dto.ConflictResponse, error) {
+	return p.detectConflicts(ctx, tx.WithContext(ctx), items)
+}
+
 // DetectConflicts checks teacher/class/classroom time overlaps, classroom
 // capacity, teacher slot preferences and dangling references to master data
 // that has changed since a snapshot was taken. It works on both stored
 // lessons (which have IDs) and snapshot lessons (which do not), by comparing
 // slice positions rather than record IDs.
 //
-// Any master-data query failure is returned to the caller. Missing records
-// found by successful queries are reported as reference-missing conflicts.
-func (p *planner) DetectConflicts(ctx context.Context, items []model.Schedule) ([]dto.ConflictResponse, error) {
+// Master data is read through the supplied executor (a plain connection or a
+// write transaction), and any lookup failure is returned. When called inside
+// an IMMEDIATE transaction the data seen here is the same data that will be
+// valid at commit, so a concurrent master-data change cannot sneak in between
+// the check and applying the timetable.
+func (p *planner) detectConflicts(ctx context.Context, exec *gorm.DB, items []model.Schedule) ([]dto.ConflictResponse, error) {
 	var conflicts []dto.ConflictResponse
 	teacherSlots := map[string]int{}
 	classSlots := map[string]int{}
 	classroomSlots := map[string]int{}
 
-	classes, err := p.classes.GetByIDs(ctx, uniqueClassIDs(items))
+	classes, err := p.loader.LoadClasses(ctx, exec, uniqueClassIDs(items))
 	if err != nil {
 		return nil, fmt.Errorf("load classes for conflict check: %w", err)
 	}
-	classroomList, err := p.classrooms.GetByIDs(ctx, uniqueClassroomIDs(items))
+	classroomList, err := p.loader.LoadClassrooms(ctx, exec, uniqueClassroomIDs(items))
 	if err != nil {
 		return nil, fmt.Errorf("load classrooms for conflict check: %w", err)
 	}
-	teacherList, err := p.teachers.GetByIDs(ctx, uniqueTeacherIDs(items))
+	teacherList, err := p.loader.LoadTeachers(ctx, exec, uniqueTeacherIDs(items))
 	if err != nil {
 		return nil, fmt.Errorf("load teachers for conflict check: %w", err)
 	}
-	courseList, err := p.courses.GetByIDs(ctx, uniqueUint(items, func(s model.Schedule) uint { return s.CourseID }))
+	courseList, err := p.loader.LoadCourses(ctx, exec, uniqueUint(items, func(s model.Schedule) uint { return s.CourseID }))
 	if err != nil {
 		return nil, fmt.Errorf("load courses for conflict check: %w", err)
 	}
-	slotList, _, err := p.timeSlots.List(ctx, 1, constants.MaxPageSize)
+	slotList, err := p.loader.LoadTimeSlots(ctx, exec)
 	if err != nil {
 		return nil, fmt.Errorf("load time slots for conflict check: %w", err)
 	}

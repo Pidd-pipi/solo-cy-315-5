@@ -4,6 +4,9 @@ package service_test
 // 时间段失败时必须返回内部错误，既不能当成“没有冲突”而覆盖在线课表，也不能
 // 误报成“资料缺失”的业务冲突。版本状态、方案当前版本、在线课表和审计日志都
 // 必须保持不变。
+//
+// 复检在 IMMEDIATE 写事务内通过 masterDataLoader 读取主数据，因此这里用故障
+// 注入 loader（经 service.WithMasterDataLoader 装配）来模拟某一类查询失败。
 
 import (
 	"context"
@@ -11,6 +14,8 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+
+	"gorm.io/gorm"
 
 	"github.com/gbschedule/gbschedule/internal/constants"
 	"github.com/gbschedule/gbschedule/internal/dto"
@@ -32,68 +37,6 @@ func mustListVersions(t *testing.T, s *versionSuite, planID uint) []dto.VersionS
 	return list
 }
 
-// ---- 故障注入仓储：只让指定的主数据查询失败，其余方法委托真实仓储 ----
-
-type faultyClassroomRepo struct {
-	repository.ClassroomRepository
-	fail bool
-}
-
-func (r *faultyClassroomRepo) GetByIDs(ctx context.Context, ids []uint) ([]model.Classroom, error) {
-	if r.fail {
-		return nil, errQueryFailed
-	}
-	return r.ClassroomRepository.GetByIDs(ctx, ids)
-}
-
-type faultyTeacherRepo struct {
-	repository.TeacherRepository
-	fail bool
-}
-
-func (r *faultyTeacherRepo) GetByIDs(ctx context.Context, ids []uint) ([]model.Teacher, error) {
-	if r.fail {
-		return nil, errQueryFailed
-	}
-	return r.TeacherRepository.GetByIDs(ctx, ids)
-}
-
-type faultyClassRepo struct {
-	repository.ClassRepository
-	fail bool
-}
-
-func (r *faultyClassRepo) GetByIDs(ctx context.Context, ids []uint) ([]model.Class, error) {
-	if r.fail {
-		return nil, errQueryFailed
-	}
-	return r.ClassRepository.GetByIDs(ctx, ids)
-}
-
-type faultyCourseRepo struct {
-	repository.CourseRepository
-	fail bool
-}
-
-func (r *faultyCourseRepo) GetByIDs(ctx context.Context, ids []uint) ([]model.Course, error) {
-	if r.fail {
-		return nil, errQueryFailed
-	}
-	return r.CourseRepository.GetByIDs(ctx, ids)
-}
-
-type faultyTimeSlotRepo struct {
-	repository.TimeSlotRepository
-	fail bool
-}
-
-func (r *faultyTimeSlotRepo) List(ctx context.Context, page, pageSize int) ([]model.TimeSlot, int64, error) {
-	if r.fail {
-		return nil, 0, errQueryFailed
-	}
-	return r.TimeSlotRepository.List(ctx, page, pageSize)
-}
-
 // faultyField 选择让哪一类主数据查询失败。
 type faultyField int
 
@@ -105,8 +48,77 @@ const (
 	faultTimeSlot
 )
 
-// svcWithFaultyPlanner 在同一数据库上构造一个版本服务，但其冲突复检所用的
-// planner 中恰好有一类主数据查询会失败。
+// faultyLoader 是 masterDataLoader 的故障注入实现：被选中的那一类查询返回
+// 错误，其余在传入的事务连接上正常查询（保持事务内一致性读取）。
+type faultyLoader struct {
+	fault faultyField
+}
+
+func (l faultyLoader) LoadClasses(ctx context.Context, exec *gorm.DB, ids []uint) ([]model.Class, error) {
+	var out []model.Class
+	if l.fault == faultClass {
+		return nil, errQueryFailed
+	}
+	if len(ids) > 0 {
+		if err := exec.WithContext(ctx).Where("id IN ?", ids).Find(&out).Error; err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (l faultyLoader) LoadClassrooms(ctx context.Context, exec *gorm.DB, ids []uint) ([]model.Classroom, error) {
+	var out []model.Classroom
+	if l.fault == faultClassroom {
+		return nil, errQueryFailed
+	}
+	if len(ids) > 0 {
+		if err := exec.WithContext(ctx).Where("id IN ?", ids).Find(&out).Error; err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (l faultyLoader) LoadTeachers(ctx context.Context, exec *gorm.DB, ids []uint) ([]model.Teacher, error) {
+	var out []model.Teacher
+	if l.fault == faultTeacher {
+		return nil, errQueryFailed
+	}
+	if len(ids) > 0 {
+		if err := exec.WithContext(ctx).Where("id IN ?", ids).Find(&out).Error; err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (l faultyLoader) LoadCourses(ctx context.Context, exec *gorm.DB, ids []uint) ([]model.Course, error) {
+	var out []model.Course
+	if l.fault == faultCourse {
+		return nil, errQueryFailed
+	}
+	if len(ids) > 0 {
+		if err := exec.WithContext(ctx).Where("id IN ?", ids).Find(&out).Error; err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (l faultyLoader) LoadTimeSlots(ctx context.Context, exec *gorm.DB) ([]model.TimeSlot, error) {
+	var out []model.TimeSlot
+	if l.fault == faultTimeSlot {
+		return nil, errQueryFailed
+	}
+	if err := exec.WithContext(ctx).Limit(constants.MaxPageSize).Order("id ASC").Find(&out).Error; err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// svcWithFaultyPlanner 构造一个版本服务，其冲突复检所用 planner 注入了恰好
+// 一类会失败的主数据加载器。
 func (s *versionSuite) svcWithFaultyPlanner(fault faultyField) service.VersionService {
 	logger := silentLogger()
 	roomRepo := repository.NewClassroomRepository(s.db)
@@ -115,22 +127,10 @@ func (s *versionSuite) svcWithFaultyPlanner(fault faultyField) service.VersionSe
 	courseRepo := repository.NewCourseRepository(s.db)
 	slotRepo := repository.NewTimeSlotRepository(s.db)
 
-	switch fault {
-	case faultClassroom:
-		roomRepo = &faultyClassroomRepo{ClassroomRepository: roomRepo, fail: true}
-	case faultTeacher:
-		teacherRepo = &faultyTeacherRepo{TeacherRepository: teacherRepo, fail: true}
-	case faultClass:
-		classRepo = &faultyClassRepo{ClassRepository: classRepo, fail: true}
-	case faultCourse:
-		courseRepo = &faultyCourseRepo{CourseRepository: courseRepo, fail: true}
-	case faultTimeSlot:
-		slotRepo = &faultyTimeSlotRepo{TimeSlotRepository: slotRepo, fail: true}
-	}
-
 	scheduleRepo := repository.NewScheduleRepository(s.db)
 	planRepo := repository.NewPlanRepository(s.db)
-	planner := service.NewPlanner(roomRepo, teacherRepo, classRepo, courseRepo, slotRepo)
+	planner := service.NewPlanner(s.db, roomRepo, teacherRepo, classRepo, courseRepo, slotRepo,
+		service.WithMasterDataLoader(faultyLoader{fault: fault}))
 	return service.NewVersionService(planRepo, scheduleRepo, planner, logger)
 }
 

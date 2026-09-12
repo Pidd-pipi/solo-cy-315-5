@@ -67,7 +67,7 @@ func newVersionFixture(t *testing.T) *versionFixture {
 	slotRepo := repository.NewTimeSlotRepository(db)
 	scheduleRepo := repository.NewScheduleRepository(db)
 	planRepo := repository.NewPlanRepository(db)
-	planner := service.NewPlanner(roomRepo, teacherRepo, classRepo, courseRepo, slotRepo)
+	planner := service.NewPlanner(db, roomRepo, teacherRepo, classRepo, courseRepo, slotRepo)
 	f.svc = service.NewVersionService(planRepo, scheduleRepo, planner, logger)
 	return f
 }

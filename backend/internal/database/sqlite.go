@@ -28,7 +28,14 @@ func SQLiteMemoryDSN(path string) string {
 }
 
 func dsnWithPragmas(path, journalMode string) string {
+	// _txlock=immediate makes every transaction acquire the write lock at
+	// BEGIN rather than lazily on first write. This serializes publish/rollback
+	// against concurrent master-data updates for the whole transaction, so the
+	// in-transaction conflict re-check cannot be invalidated before commit
+	// (closing the check-then-act / TOCTOU window). busy_timeout makes the
+	// loser wait briefly instead of failing immediately with SQLITE_BUSY.
 	pragmas := []string{
+		"_txlock=immediate",
 		"_pragma=busy_timeout(5000)",
 		"_pragma=journal_mode(" + journalMode + ")",
 		"_pragma=foreign_keys(ON)",

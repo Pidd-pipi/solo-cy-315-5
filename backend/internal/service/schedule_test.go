@@ -32,6 +32,7 @@ func newScheduleTestDB(t *testing.T) *gorm.DB {
 func newScheduleService(t *testing.T, db *gorm.DB) service.ScheduleService {
 	logger := slog.New(slog.NewTextHandler(&strings.Builder{}, nil))
 	return service.NewScheduleService(
+		db,
 		repository.NewScheduleRepository(db),
 		repository.NewClassroomRepository(db),
 		repository.NewTeacherRepository(db),

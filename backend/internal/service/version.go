@@ -263,29 +263,32 @@ func (s *versionService) Publish(ctx context.Context, planID, versionID uint, re
 		return nil, fmt.Errorf("decode snapshot: %w", err)
 	}
 
-	// Re-check conflicts against current master data before publishing.
-	// A master-data lookup failure aborts with an internal error before any
-	// write; only successful lookups with real conflicts reject the release.
-	conflicts, err := s.planner.DetectConflicts(ctx, toModelSchedules(lessons))
-	if err != nil {
-		return nil, fmt.Errorf("re-check conflicts before publish: %w", err)
-	}
-	if len(conflicts) > 0 {
-		err := ConflictWithData(fmt.Sprintf("publish rejected: %d conflict(s) found in version %d (%s), resolve them before publishing", len(conflicts), version.ID, version.Name),
-			map[string]any{"conflict_count": len(conflicts), "conflicts": conflicts})
-		_ = s.recordLog(ctx, planID, version.ID, constants.ActionVersionReject, req.Operator,
-			map[string]any{"operation": "publish", "reason": err.Error(), "conflict_count": len(conflicts)})
-		return nil, err
-	}
-
 	var appliedRows int64
-	if err := s.plans.Transaction(ctx, func(tx *gorm.DB) error {
+	if err := s.retryOnTxContention(ctx, func(tx *gorm.DB) error {
 		// Conditional UPDATE ... WHERE status='draft' makes the publish
 		// decision and state flip atomic under concurrency: only one racing
 		// request matches a row, so a version can never be published twice.
 		current, err := s.plans.PublishVersionIfDraftTx(ctx, tx, version.ID, req.Operator, req.Remark, time.Now())
 		if err != nil {
 			return err
+		}
+
+		// Re-check conflicts through the same write transaction, right before
+		// applying the timetable. Because the transaction started as
+		// IMMEDIATE it already holds the write lock, so no concurrent
+		// master-data change (room capacity, teacher preferences, referenced
+		// records) can be committed between this check and the schedule
+		// replacement below. A conflict or lookup error rolls back the state
+		// flip and schedule replacement atomically — partial state is impossible.
+		conflicts, err := s.planner.DetectConflictsTx(ctx, tx, toModelSchedules(lessons))
+		if err != nil {
+			return fmt.Errorf("re-check conflicts before publish: %w", err)
+		}
+		if len(conflicts) > 0 {
+			return ConflictWithData(
+				fmt.Sprintf("publish rejected: %d conflict(s) found in version %d (%s), resolve them before publishing", len(conflicts), version.ID, version.Name),
+				map[string]any{"conflict_count": len(conflicts), "conflicts": conflicts},
+			)
 		}
 
 		activePlan, err := s.plans.GetPlanTx(ctx, tx, plan.ID)
@@ -307,13 +310,26 @@ func (s *versionService) Publish(ctx context.Context, planID, versionID uint, re
 			Detail: mustJSON(map[string]any{"applied_rows": rows, "remark": req.Remark}),
 		})
 	}); err != nil {
-		if errors.Is(err, repository.ErrConcurrentUpdate) {
+		switch {
+		case errors.Is(err, repository.ErrConcurrentUpdate):
 			bizErr := ConflictWithData("version was already published by another request", nil)
 			_ = s.recordLog(ctx, planID, version.ID, constants.ActionVersionReject, req.Operator,
 				map[string]any{"operation": "publish", "reason": bizErr.Error()})
 			return nil, bizErr
+		case errors.Is(err, ErrConflict):
+			// Genuine conflicts detected inside the write transaction: the whole
+			// transaction (including the status flip) rolled back. Audit the
+			// business rejection once and return the conflict payload.
+			bizErr := asBusinessError(err, ErrConflict)
+			if bizErr != nil {
+				_ = s.recordLog(ctx, planID, version.ID, constants.ActionVersionReject, req.Operator,
+					map[string]any{"operation": "publish", "reason": bizErr.Error(), "conflict_count": conflictCountFrom(bizErr)})
+				return nil, bizErr
+			}
+			return nil, err
+		default:
+			return nil, fmt.Errorf("publish version: %w", err)
 		}
-		return nil, fmt.Errorf("publish version: %w", err)
 	}
 
 	refreshed, err := s.plans.GetVersion(ctx, versionID)
@@ -350,25 +366,6 @@ func (s *versionService) Rollback(ctx context.Context, planID, versionID uint, r
 		return nil, fmt.Errorf("decode snapshot: %w", err)
 	}
 
-	// Re-check conflicts against current master data before the rollback can
-	// overwrite the live timetable. A previously valid release may have become
-	// unusable after classroom capacity changes, teacher preference updates or
-	// deletion of referenced master data — in that case the rollback is
-	// rejected with the concrete conflicts, exactly like publishing a draft.
-	// A master-data lookup failure aborts with an internal error before any
-	// write, so a query failure can never masquerade as "missing reference".
-	conflicts, err := s.planner.DetectConflicts(ctx, toModelSchedules(lessons))
-	if err != nil {
-		return nil, fmt.Errorf("re-check conflicts before rollback: %w", err)
-	}
-	if len(conflicts) > 0 {
-		err := ConflictWithData(fmt.Sprintf("rollback rejected: %d conflict(s) found in published version %d (%s) against current master data, resolve them before rolling back", len(conflicts), source.ID, source.Name),
-			map[string]any{"conflict_count": len(conflicts), "conflicts": conflicts})
-		_ = s.recordLog(ctx, planID, source.ID, constants.ActionVersionReject, req.Operator,
-			map[string]any{"operation": "rollback", "reason": err.Error(), "conflict_count": len(conflicts)})
-		return nil, err
-	}
-
 	rollbackName := req.Name
 	if strings.TrimSpace(rollbackName) == "" {
 		rollbackName = fmt.Sprintf("回滚至 v%d - %s", source.VersionNo, source.Name)
@@ -389,7 +386,23 @@ func (s *versionService) Rollback(ctx context.Context, planID, versionID uint, r
 	}
 
 	var appliedRows int64
-	if err := s.retryOnTxContention(ctx, func(tx *gorm.DB) error {
+	err = s.retryOnTxContention(ctx, func(tx *gorm.DB) error {
+		// Re-validate inside the IMMEDIATE write transaction, before creating
+		// the rollback version and before touching the live timetable. Holding
+		// the write lock guarantees no master-data change can commit between
+		// this check and the schedule replacement: either the whole rollback
+		// switches (version + pointer + timetable), or it rolls back entirely.
+		conflicts, err := s.planner.DetectConflictsTx(ctx, tx, toModelSchedules(lessons))
+		if err != nil {
+			return fmt.Errorf("re-check conflicts before rollback: %w", err)
+		}
+		if len(conflicts) > 0 {
+			return ConflictWithData(
+				fmt.Sprintf("rollback rejected: %d conflict(s) found in published version %d (%s) against current master data, resolve them before rolling back", len(conflicts), source.ID, source.Name),
+				map[string]any{"conflict_count": len(conflicts), "conflicts": conflicts},
+			)
+		}
+
 		count, err := s.plans.CountVersionsTx(ctx, tx, plan.ID)
 		if err != nil {
 			return err
@@ -420,7 +433,13 @@ func (s *versionService) Rollback(ctx context.Context, planID, versionID uint, r
 			PlanID: plan.ID, VersionID: rollbackVersion.ID, Action: constants.ActionVersionRollback, Operator: req.Operator,
 			Detail: mustJSON(map[string]any{"source_version_id": source.ID, "source_version_no": source.VersionNo, "new_version_id": rollbackVersion.ID, "applied_rows": rows}),
 		})
-	}); err != nil {
+	})
+	if err != nil {
+		if bizErr := asBusinessError(err, ErrConflict); bizErr != nil {
+			_ = s.recordLog(ctx, planID, source.ID, constants.ActionVersionReject, req.Operator,
+				map[string]any{"operation": "rollback", "reason": bizErr.Error(), "conflict_count": conflictCountFrom(bizErr)})
+			return nil, bizErr
+		}
 		return nil, mapWriteError("rollback version", err)
 	}
 
@@ -543,13 +562,37 @@ func (s *versionService) versionDetail(ctx context.Context, version *model.Sched
 }
 
 func (s *versionService) recordLog(ctx context.Context, planID, versionID uint, action, operator string, detail any) error {
-	return s.plans.CreateOperationLog(ctx, &model.VersionOperationLog{
+	log := &model.VersionOperationLog{
 		PlanID:    planID,
 		VersionID: versionID,
 		Action:    action,
 		Operator:  operator,
 		Detail:    mustJSON(detail),
-	})
+	}
+	// Audit rows must not be lost under contention: a rejected publish/rollback
+	// can run its audit INSERT while the winning transaction still holds the
+	// write lock. Retry transient lock-busy errors instead of dropping the row.
+	var lastErr error
+	for attempt := 0; attempt < maxVersionTxRetries; attempt++ {
+		err := s.plans.CreateOperationLog(ctx, log)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !repository.IsLockBusyError(err) {
+			return err
+		}
+		wait := time.Duration(2<<uint(attempt))*time.Millisecond + time.Duration(attempt%3)*time.Millisecond
+		if wait > 80*time.Millisecond {
+			wait = 80 * time.Millisecond
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+	return fmt.Errorf("record operation log after retries: %w", lastErr)
 }
 
 func planResponse(plan *model.SchedulePlan) dto.PlanResponse {
@@ -726,4 +769,32 @@ func mustJSON(v any) string {
 		return "{}"
 	}
 	return string(data)
+}
+
+// asBusinessError returns the *BusinessError carried by err when err wraps the
+// given sentinel, otherwise nil.
+func asBusinessError(err error, sentinel error) *BusinessError {
+	if !errors.Is(err, sentinel) {
+		return nil
+	}
+	var bizErr *BusinessError
+	if errors.As(err, &bizErr) {
+		return bizErr
+	}
+	return nil
+}
+
+// conflictCountFrom extracts the conflict_count from a BusinessError's data.
+func conflictCountFrom(bizErr *BusinessError) int {
+	if bizErr == nil || bizErr.Data == nil {
+		return 0
+	}
+	data, ok := bizErr.Data.(map[string]any)
+	if !ok {
+		return 0
+	}
+	if n, ok := data["conflict_count"].(int); ok {
+		return n
+	}
+	return 0
 }
