@@ -19,7 +19,9 @@ type Planner interface {
 	Plan(ctx context.Context, req *dto.GenerateScheduleRequest) (items []model.Schedule, placementConflicts []dto.ConflictResponse, required int, err error)
 	// DetectConflicts re-validates lessons against current master data
 	// (teacher/class/classroom occupancy, room capacity, teacher preferences).
-	DetectConflicts(ctx context.Context, items []model.Schedule) []dto.ConflictResponse
+	// Master-data lookup failures are returned as errors: callers must treat
+	// them as internal failures, never as "no conflict" or "reference missing".
+	DetectConflicts(ctx context.Context, items []model.Schedule) ([]dto.ConflictResponse, error)
 	// Enrich fills related names for timetable entries.
 	Enrich(ctx context.Context, items []model.Schedule) ([]dto.ScheduleResponse, error)
 }
@@ -243,22 +245,40 @@ func (p *planner) resolveClassrooms(ctx context.Context, req *dto.GenerateSchedu
 	return items, nil
 }
 
-// detectConflicts checks teacher/class/classroom time overlaps, classroom
+// DetectConflicts checks teacher/class/classroom time overlaps, classroom
 // capacity, teacher slot preferences and dangling references to master data
 // that has changed since a snapshot was taken. It works on both stored
-// lessons (which have IDs) and snapshot lessons (which do not), by
-// comparing slice positions rather than record IDs.
-func (p *planner) DetectConflicts(ctx context.Context, items []model.Schedule) []dto.ConflictResponse {
+// lessons (which have IDs) and snapshot lessons (which do not), by comparing
+// slice positions rather than record IDs.
+//
+// Any master-data query failure is returned to the caller. Missing records
+// found by successful queries are reported as reference-missing conflicts.
+func (p *planner) DetectConflicts(ctx context.Context, items []model.Schedule) ([]dto.ConflictResponse, error) {
 	var conflicts []dto.ConflictResponse
 	teacherSlots := map[string]int{}
 	classSlots := map[string]int{}
 	classroomSlots := map[string]int{}
 
-	classes, _ := p.classes.GetByIDs(ctx, uniqueClassIDs(items))
-	classroomList, _ := p.classrooms.GetByIDs(ctx, uniqueClassroomIDs(items))
-	teacherList, _ := p.teachers.GetByIDs(ctx, uniqueTeacherIDs(items))
-	courseList, _ := p.courses.GetByIDs(ctx, uniqueUint(items, func(s model.Schedule) uint { return s.CourseID }))
-	slotList, _, _ := p.timeSlots.List(ctx, 1, constants.MaxPageSize)
+	classes, err := p.classes.GetByIDs(ctx, uniqueClassIDs(items))
+	if err != nil {
+		return nil, fmt.Errorf("load classes for conflict check: %w", err)
+	}
+	classroomList, err := p.classrooms.GetByIDs(ctx, uniqueClassroomIDs(items))
+	if err != nil {
+		return nil, fmt.Errorf("load classrooms for conflict check: %w", err)
+	}
+	teacherList, err := p.teachers.GetByIDs(ctx, uniqueTeacherIDs(items))
+	if err != nil {
+		return nil, fmt.Errorf("load teachers for conflict check: %w", err)
+	}
+	courseList, err := p.courses.GetByIDs(ctx, uniqueUint(items, func(s model.Schedule) uint { return s.CourseID }))
+	if err != nil {
+		return nil, fmt.Errorf("load courses for conflict check: %w", err)
+	}
+	slotList, _, err := p.timeSlots.List(ctx, 1, constants.MaxPageSize)
+	if err != nil {
+		return nil, fmt.Errorf("load time slots for conflict check: %w", err)
+	}
 
 	classMap := map[uint]model.Class{}
 	for i := range classes {
@@ -358,7 +378,7 @@ func (p *planner) DetectConflicts(ctx context.Context, items []model.Schedule) [
 		classSlots[classKey] = idx
 		classroomSlots[classroomKey] = idx
 	}
-	return conflicts
+	return conflicts, nil
 }
 
 func missingReferenceConflict(entityType string, entityID uint, item model.Schedule, suggestion string) dto.ConflictResponse {

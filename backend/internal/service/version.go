@@ -264,7 +264,12 @@ func (s *versionService) Publish(ctx context.Context, planID, versionID uint, re
 	}
 
 	// Re-check conflicts against current master data before publishing.
-	conflicts := s.planner.DetectConflicts(ctx, toModelSchedules(lessons))
+	// A master-data lookup failure aborts with an internal error before any
+	// write; only successful lookups with real conflicts reject the release.
+	conflicts, err := s.planner.DetectConflicts(ctx, toModelSchedules(lessons))
+	if err != nil {
+		return nil, fmt.Errorf("re-check conflicts before publish: %w", err)
+	}
 	if len(conflicts) > 0 {
 		err := ConflictWithData(fmt.Sprintf("publish rejected: %d conflict(s) found in version %d (%s), resolve them before publishing", len(conflicts), version.ID, version.Name),
 			map[string]any{"conflict_count": len(conflicts), "conflicts": conflicts})
@@ -350,7 +355,12 @@ func (s *versionService) Rollback(ctx context.Context, planID, versionID uint, r
 	// unusable after classroom capacity changes, teacher preference updates or
 	// deletion of referenced master data — in that case the rollback is
 	// rejected with the concrete conflicts, exactly like publishing a draft.
-	conflicts := s.planner.DetectConflicts(ctx, toModelSchedules(lessons))
+	// A master-data lookup failure aborts with an internal error before any
+	// write, so a query failure can never masquerade as "missing reference".
+	conflicts, err := s.planner.DetectConflicts(ctx, toModelSchedules(lessons))
+	if err != nil {
+		return nil, fmt.Errorf("re-check conflicts before rollback: %w", err)
+	}
 	if len(conflicts) > 0 {
 		err := ConflictWithData(fmt.Sprintf("rollback rejected: %d conflict(s) found in published version %d (%s) against current master data, resolve them before rolling back", len(conflicts), source.ID, source.Name),
 			map[string]any{"conflict_count": len(conflicts), "conflicts": conflicts})

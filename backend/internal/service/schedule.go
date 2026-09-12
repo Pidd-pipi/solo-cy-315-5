@@ -130,7 +130,11 @@ func (s *scheduleService) CheckConflicts(ctx context.Context) ([]dto.ConflictRes
 	if err != nil {
 		return nil, fmt.Errorf("list schedules for conflict check: %w", err)
 	}
-	return s.planner.DetectConflicts(ctx, items), nil
+	conflicts, err := s.planner.DetectConflicts(ctx, items)
+	if err != nil {
+		return nil, fmt.Errorf("check timetable conflicts: %w", err)
+	}
+	return conflicts, nil
 }
 
 func (s *scheduleService) Swap(ctx context.Context, req *dto.SwapScheduleRequest) (*dto.AdjustmentResponse, error) {
