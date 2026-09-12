@@ -3,7 +3,9 @@ package repository
 import (
 	"context"
 	"fmt"
+	"time"
 
+	"github.com/gbschedule/gbschedule/internal/constants"
 	"github.com/gbschedule/gbschedule/internal/model"
 	"gorm.io/gorm"
 )
@@ -22,7 +24,12 @@ type PlanRepository interface {
 	GetVersionTx(ctx context.Context, tx *gorm.DB, id uint) (*model.ScheduleVersion, error)
 	ListVersions(ctx context.Context, planID uint) ([]model.ScheduleVersion, error)
 	CountVersions(ctx context.Context, planID uint) (int64, error)
+	CountVersionsTx(ctx context.Context, tx *gorm.DB, planID uint) (int64, error)
 	UpdateVersionTx(ctx context.Context, tx *gorm.DB, version *model.ScheduleVersion) error
+	// PublishVersionIfDraftTx atomically flips a draft to published. It returns
+	// ErrConcurrentUpdate when the version is no longer in draft state (e.g. a
+	// concurrent publish won the race), so callers never double-publish.
+	PublishVersionIfDraftTx(ctx context.Context, tx *gorm.DB, id uint, publishedBy, remark string, publishedAt time.Time) (*model.ScheduleVersion, error)
 
 	CreateOperationLog(ctx context.Context, log *model.VersionOperationLog) error
 	CreateOperationLogTx(ctx context.Context, tx *gorm.DB, log *model.VersionOperationLog) error
@@ -117,12 +124,43 @@ func (r *planRepository) ListVersions(ctx context.Context, planID uint) ([]model
 }
 
 func (r *planRepository) CountVersions(ctx context.Context, planID uint) (int64, error) {
+	return r.CountVersionsTx(ctx, r.db.WithContext(ctx), planID)
+}
+
+func (r *planRepository) CountVersionsTx(ctx context.Context, tx *gorm.DB, planID uint) (int64, error) {
 	var total int64
-	if err := r.db.WithContext(ctx).Model(&model.ScheduleVersion{}).
+	if err := tx.WithContext(ctx).Model(&model.ScheduleVersion{}).
 		Where("plan_id = ?", planID).Count(&total).Error; err != nil {
 		return 0, fmt.Errorf("count versions: %w", err)
 	}
 	return total, nil
+}
+
+// PublishVersionIfDraftTx conditionally promotes a draft. The WHERE clause on
+// status makes the decision and the state change atomic: only one concurrent
+// caller's UPDATE matches a row.
+func (r *planRepository) PublishVersionIfDraftTx(ctx context.Context, tx *gorm.DB, id uint, publishedBy, remark string, publishedAt time.Time) (*model.ScheduleVersion, error) {
+	updates := map[string]any{
+		"status":       constants.VersionStatusPublished,
+		"published_by": publishedBy,
+		"published_at": publishedAt,
+	}
+	if remark != "" {
+		updates["remark"] = remark
+	}
+	result := tx.WithContext(ctx).Model(&model.ScheduleVersion{}).
+		Where("id = ? AND status = ?", id, constants.VersionStatusDraft).
+		Updates(updates)
+	if result.Error != nil {
+		if isConstraintError(result.Error) {
+			return nil, ErrConstraint
+		}
+		return nil, fmt.Errorf("publish version: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return nil, ErrConcurrentUpdate
+	}
+	return r.GetVersionTx(ctx, tx, id)
 }
 
 func (r *planRepository) UpdateVersionTx(ctx context.Context, tx *gorm.DB, version *model.ScheduleVersion) error {

@@ -37,3 +37,26 @@ func isConstraintError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "unique constraint failed") || strings.Contains(msg, "duplicated key not allowed")
 }
+
+// IsLockBusyError reports whether err is a transient lock contention error
+// (SQLITE_BUSY / SQLITE_LOCKED) that justifies retrying the operation.
+func IsLockBusyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, needle := range []string{"database is locked", "database table is locked", "database is busy", "sqlite_busy", "sqlite_locked"} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// AsLockBusy wraps a raw driver error as ErrLockBusy when it is lock contention.
+func AsLockBusy(err error) error {
+	if IsLockBusyError(err) {
+		return fmt.Errorf("%w: %v", ErrLockBusy, err)
+	}
+	return err
+}

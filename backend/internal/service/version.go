@@ -142,16 +142,16 @@ func (s *versionService) CreateDraft(ctx context.Context, planID uint, req *dto.
 		CreatedBy:   req.Operator,
 		Remark:      req.Remark,
 	}
-	if err := s.plans.Transaction(ctx, func(tx *gorm.DB) error {
-		count, err := s.plans.CountVersions(ctx, plan.ID)
+	if err := s.retryOnTxContention(ctx, func(tx *gorm.DB) error {
+		count, err := s.plans.CountVersionsTx(ctx, tx, plan.ID)
 		if err != nil {
 			return err
 		}
+		// Reset the auto-populated primary key so a retried attempt gets a new
+		// row identity; the previous failed insert rolled back its ID.
+		version.ID = 0
 		version.VersionNo = int(count) + 1
 		if err := s.plans.CreateVersionTx(ctx, tx, version); err != nil {
-			if errors.Is(err, repository.ErrConstraint) {
-				return ErrConflict
-			}
 			return err
 		}
 		return s.plans.CreateOperationLogTx(ctx, tx, &model.VersionOperationLog{
@@ -275,22 +275,11 @@ func (s *versionService) Publish(ctx context.Context, planID, versionID uint, re
 
 	var appliedRows int64
 	if err := s.plans.Transaction(ctx, func(tx *gorm.DB) error {
-		// Re-read inside the transaction to close the duplicate-publish race.
-		current, err := s.plans.GetVersionTx(ctx, tx, version.ID)
+		// Conditional UPDATE ... WHERE status='draft' makes the publish
+		// decision and state flip atomic under concurrency: only one racing
+		// request matches a row, so a version can never be published twice.
+		current, err := s.plans.PublishVersionIfDraftTx(ctx, tx, version.ID, req.Operator, req.Remark, time.Now())
 		if err != nil {
-			return err
-		}
-		if current.Status != constants.VersionStatusDraft {
-			return ErrConflict
-		}
-		now := time.Now()
-		current.Status = constants.VersionStatusPublished
-		current.PublishedBy = req.Operator
-		current.PublishedAt = &now
-		if req.Remark != "" {
-			current.Remark = req.Remark
-		}
-		if err := s.plans.UpdateVersionTx(ctx, tx, current); err != nil {
 			return err
 		}
 
@@ -313,7 +302,7 @@ func (s *versionService) Publish(ctx context.Context, planID, versionID uint, re
 			Detail: mustJSON(map[string]any{"applied_rows": rows, "remark": req.Remark}),
 		})
 	}); err != nil {
-		if errors.Is(err, ErrConflict) {
+		if errors.Is(err, repository.ErrConcurrentUpdate) {
 			bizErr := ConflictWithData("version was already published by another request", nil)
 			_ = s.recordLog(ctx, planID, version.ID, constants.ActionVersionReject, req.Operator,
 				map[string]any{"operation": "publish", "reason": bizErr.Error()})
@@ -390,18 +379,16 @@ func (s *versionService) Rollback(ctx context.Context, planID, versionID uint, r
 	}
 
 	var appliedRows int64
-	if err := s.plans.Transaction(ctx, func(tx *gorm.DB) error {
-		count, err := s.plans.CountVersions(ctx, plan.ID)
+	if err := s.retryOnTxContention(ctx, func(tx *gorm.DB) error {
+		count, err := s.plans.CountVersionsTx(ctx, tx, plan.ID)
 		if err != nil {
 			return err
 		}
+		rollbackVersion.ID = 0
 		rollbackVersion.VersionNo = int(count) + 1
 		now := time.Now()
 		rollbackVersion.PublishedAt = &now
 		if err := s.plans.CreateVersionTx(ctx, tx, rollbackVersion); err != nil {
-			if errors.Is(err, repository.ErrConstraint) {
-				return ErrConflict
-			}
 			return err
 		}
 

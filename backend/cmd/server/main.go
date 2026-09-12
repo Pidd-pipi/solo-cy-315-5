@@ -9,12 +9,11 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
-	gormlogger "gorm.io/gorm/logger"
 
 	_ "github.com/gbschedule/gbschedule/docs"
 	"github.com/gbschedule/gbschedule/internal/config"
+	"github.com/gbschedule/gbschedule/internal/database"
 	"github.com/gbschedule/gbschedule/internal/handler"
 	"github.com/gbschedule/gbschedule/internal/model"
 	"github.com/gbschedule/gbschedule/internal/repository"
@@ -87,12 +86,9 @@ func openDatabase(path string) (*gorm.DB, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create db dir: %w", err)
 	}
-	db, err := gorm.Open(sqlite.Open(path), &gorm.Config{
-		Logger:         gormlogger.Default.LogMode(gormlogger.Silent),
-		TranslateError: true,
-	})
+	db, err := database.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
+		return nil, err
 	}
 	return db, nil
 }
