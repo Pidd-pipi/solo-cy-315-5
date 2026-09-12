@@ -389,6 +389,158 @@ func TestVersionRollback(t *testing.T) {
 	}
 }
 
+// setupTwoPublishedVersions publishes v1 (1 周) 然后 v2 (2 周)，在线课表为 2 节，
+// 供回滚冲突门禁测试使用。
+func setupTwoPublishedVersions(t *testing.T) (*versionFixture, *dto.PlanResponse, uint, uint) {
+	t.Helper()
+	f := newVersionFixture(t)
+	plan := f.createPlan(t, "门禁方案")
+	v1 := f.createDraft(t, plan.ID, f.draftReq("第一版", "alice", 1, f.teacher.ID))
+	if _, err := f.svc.Publish(f.ctx, plan.ID, v1.Version.ID, &dto.PublishVersionRequest{Operator: "alice"}); err != nil {
+		t.Fatalf("publish v1: %v", err)
+	}
+	v2 := f.createDraft(t, plan.ID, f.draftReq("第二版", "alice", 2, f.teacher.ID))
+	if _, err := f.svc.Publish(f.ctx, plan.ID, v2.Version.ID, &dto.PublishVersionRequest{Operator: "alice"}); err != nil {
+		t.Fatalf("publish v2: %v", err)
+	}
+	return f, plan, v1.Version.ID, v2.Version.ID
+}
+
+func assertConflictRejection(t *testing.T, err error, wantType string) *service.BusinessError {
+	t.Helper()
+	if err == nil {
+		t.Fatal("rollback must be rejected, got nil")
+	}
+	if !errors.Is(err, service.ErrConflict) {
+		t.Fatalf("rollback rejection must wrap ErrConflict, got %v", err)
+	}
+	var bizErr *service.BusinessError
+	if !errors.As(err, &bizErr) {
+		t.Fatalf("rejection must carry conflict data, got %v", err)
+	}
+	if !strings.Contains(bizErr.Error(), "rollback rejected") {
+		t.Fatalf("rejection message must explain rollback context: %v", err)
+	}
+	data, _ := bizErr.Data.(map[string]any)
+	rawConflicts, _ := data["conflicts"].([]dto.ConflictResponse)
+	found := false
+	for _, c := range rawConflicts {
+		if c.Type == wantType {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected conflict type %s in rejection payload, got %#v", wantType, data["conflicts"])
+	}
+	return bizErr
+}
+
+// 5b. 回滚冲突门禁：已发布版本在容量/教师偏好/基础资料变化后不再可用时，
+// 回滚必须在覆盖在线课表前被拒绝并给出具体原因。
+func TestVersionRollbackRejectsConflicts(t *testing.T) {
+	t.Run("教室容量缩小", func(t *testing.T) {
+		f, plan, v1, v2 := setupTwoPublishedVersions(t)
+		if err := f.db.Model(&model.Classroom{}).Where("id = ?", f.room.ID).Update("capacity", 20).Error; err != nil {
+			t.Fatalf("shrink room: %v", err)
+		}
+		_, rbErr := f.svc.Rollback(f.ctx, plan.ID, v1, &dto.RollbackVersionRequest{Operator: "bob"})
+		assertConflictRejection(t, rbErr, constants.ConflictClassroomCap)
+		assertRollbackRejectedSideEffects(t, f, plan, v2)
+
+		// 恢复容量后回滚应成功，在线课表恢复为 v1 的 1 节。
+		if err := f.db.Model(&model.Classroom{}).Where("id = ?", f.room.ID).Update("capacity", 50).Error; err != nil {
+			t.Fatalf("restore room: %v", err)
+		}
+		rb, err := f.svc.Rollback(f.ctx, plan.ID, v1, &dto.RollbackVersionRequest{Operator: "bob", Name: "恢复回滚"})
+		if err != nil {
+			t.Fatalf("rollback after restoring capacity: %v", err)
+		}
+		if got := liveScheduleCount(t, f.db); got != 1 {
+			t.Fatalf("live schedules after rollback = %d, want 1", got)
+		}
+		if rb.RollbackVersion.Status != constants.VersionStatusPublished || rb.Plan.CurrentVersionID != rb.RollbackVersion.ID {
+			t.Fatalf("rollback result wrong: %+v", rb)
+		}
+		logs, _, _ := f.svc.ListOperationLogs(f.ctx, plan.ID, 1, 50)
+		var rejected, rolledBack bool
+		for _, l := range logs {
+			if l.Action == constants.ActionVersionReject && l.Operator == "bob" {
+				rejected = true
+			}
+			if l.Action == constants.ActionVersionRollback && l.Operator == "bob" {
+				rolledBack = true
+			}
+		}
+		if !rejected || !rolledBack {
+			t.Fatalf("both rejection and successful rollback must be audited: rejected=%v rolledBack=%v", rejected, rolledBack)
+		}
+	})
+
+	t.Run("教师偏好变更", func(t *testing.T) {
+		f, plan, v1, v2 := setupTwoPublishedVersions(t)
+		f.teacher.UnavailableSlots = []string{f.slot.Code}
+		if err := f.db.Save(f.teacher).Error; err != nil {
+			t.Fatalf("update teacher preference: %v", err)
+		}
+		_, err := f.svc.Rollback(f.ctx, plan.ID, v1, &dto.RollbackVersionRequest{Operator: "bob"})
+		assertConflictRejection(t, err, constants.ConflictTeacherPref)
+		assertRollbackRejectedSideEffects(t, f, plan, v2)
+	})
+
+	t.Run("引用教室被删除", func(t *testing.T) {
+		f, plan, v1, v2 := setupTwoPublishedVersions(t)
+		if err := f.db.Delete(&model.Classroom{}, f.room.ID).Error; err != nil {
+			t.Fatalf("delete classroom: %v", err)
+		}
+		_, err := f.svc.Rollback(f.ctx, plan.ID, v1, &dto.RollbackVersionRequest{Operator: "bob"})
+		assertConflictRejection(t, err, constants.ConflictReferenceMissing)
+		assertRollbackRejectedSideEffects(t, f, plan, v2)
+	})
+
+	t.Run("引用教师被删除", func(t *testing.T) {
+		f, plan, v1, v2 := setupTwoPublishedVersions(t)
+		if err := f.db.Delete(&model.Teacher{}, f.teacher.ID).Error; err != nil {
+			t.Fatalf("delete teacher: %v", err)
+		}
+		_, err := f.svc.Rollback(f.ctx, plan.ID, v1, &dto.RollbackVersionRequest{Operator: "bob"})
+		assertConflictRejection(t, err, constants.ConflictReferenceMissing)
+		assertRollbackRejectedSideEffects(t, f, plan, v2)
+	})
+}
+
+// assertRollbackRejectedSideEffects 验证回滚被拒后：在线课表未被覆盖、
+// 方案当前版本不变、没有生成新回滚版本、拒绝操作已审计。
+func assertRollbackRejectedSideEffects(t *testing.T, f *versionFixture, plan *dto.PlanResponse, currentVersionID uint) {
+	t.Helper()
+	if got := liveScheduleCount(t, f.db); got != 2 {
+		t.Fatalf("rejected rollback must not touch live schedules, got %d rows (want 2)", got)
+	}
+	gotPlan, err := f.svc.GetPlan(f.ctx, plan.ID)
+	if err != nil {
+		t.Fatalf("reload plan: %v", err)
+	}
+	if gotPlan.CurrentVersionID != currentVersionID {
+		t.Fatalf("plan current version must stay %d, got %d", currentVersionID, gotPlan.CurrentVersionID)
+	}
+	versions, err := f.svc.ListVersions(f.ctx, plan.ID)
+	if err != nil {
+		t.Fatalf("list versions: %v", err)
+	}
+	if len(versions) != 2 {
+		t.Fatalf("rejected rollback must not create a version, got %d versions", len(versions))
+	}
+	logs, _, err := f.svc.ListOperationLogs(f.ctx, plan.ID, 1, 50)
+	if err != nil {
+		t.Fatalf("list logs: %v", err)
+	}
+	for _, l := range logs {
+		if l.Action == constants.ActionVersionReject {
+			return
+		}
+	}
+	t.Fatal("rejected rollback must be recorded in operation logs")
+}
+
 // 6a. 重复发布拒绝：已发布版本不能再次发布。
 func TestVersionDuplicatePublishRejected(t *testing.T) {
 	f := newVersionFixture(t)

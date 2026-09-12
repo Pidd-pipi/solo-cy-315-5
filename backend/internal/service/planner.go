@@ -244,9 +244,10 @@ func (p *planner) resolveClassrooms(ctx context.Context, req *dto.GenerateSchedu
 }
 
 // detectConflicts checks teacher/class/classroom time overlaps, classroom
-// capacity and teacher slot preferences. It works on both stored lessons
-// (which have IDs) and snapshot lessons (which do not), by comparing slice
-// positions rather than record IDs.
+// capacity, teacher slot preferences and dangling references to master data
+// that has changed since a snapshot was taken. It works on both stored
+// lessons (which have IDs) and snapshot lessons (which do not), by
+// comparing slice positions rather than record IDs.
 func (p *planner) DetectConflicts(ctx context.Context, items []model.Schedule) []dto.ConflictResponse {
 	var conflicts []dto.ConflictResponse
 	teacherSlots := map[string]int{}
@@ -256,6 +257,7 @@ func (p *planner) DetectConflicts(ctx context.Context, items []model.Schedule) [
 	classes, _ := p.classes.GetByIDs(ctx, uniqueClassIDs(items))
 	classroomList, _ := p.classrooms.GetByIDs(ctx, uniqueClassroomIDs(items))
 	teacherList, _ := p.teachers.GetByIDs(ctx, uniqueTeacherIDs(items))
+	courseList, _ := p.courses.GetByIDs(ctx, uniqueUint(items, func(s model.Schedule) uint { return s.CourseID }))
 	slotList, _, _ := p.timeSlots.List(ctx, 1, constants.MaxPageSize)
 
 	classMap := map[uint]model.Class{}
@@ -270,6 +272,10 @@ func (p *planner) DetectConflicts(ctx context.Context, items []model.Schedule) [
 	for i := range teacherList {
 		teacherMap[teacherList[i].ID] = teacherList[i]
 	}
+	courseMap := map[uint]model.Course{}
+	for i := range courseList {
+		courseMap[courseList[i].ID] = courseList[i]
+	}
 	slotMap := map[uint]model.TimeSlot{}
 	for i := range slotList {
 		slotMap[slotList[i].ID] = slotList[i]
@@ -277,28 +283,56 @@ func (p *planner) DetectConflicts(ctx context.Context, items []model.Schedule) [
 
 	for idx := range items {
 		item := items[idx]
+
+		// A snapshot may reference master data deleted after the version was
+		// created. Flag every dangling reference so publish/rollback can
+		// reject a snapshot that is no longer applicable.
+		if _, ok := teacherMap[item.TeacherID]; !ok {
+			conflicts = append(conflicts, missingReferenceConflict("teacher", item.TeacherID, item,
+				fmt.Sprintf("teacher %d referenced by the version no longer exists; update the timetable before publishing", item.TeacherID)))
+		}
+		if _, ok := classMap[item.ClassID]; !ok {
+			conflicts = append(conflicts, missingReferenceConflict("class", item.ClassID, item,
+				fmt.Sprintf("class %d referenced by the version no longer exists; update the timetable before publishing", item.ClassID)))
+		}
+		if _, ok := classroomMap[item.ClassroomID]; !ok {
+			conflicts = append(conflicts, missingReferenceConflict("classroom", item.ClassroomID, item,
+				fmt.Sprintf("classroom %d referenced by the version no longer exists; update the timetable before publishing", item.ClassroomID)))
+		}
+		if _, ok := courseMap[item.CourseID]; !ok {
+			conflicts = append(conflicts, missingReferenceConflict("course", item.CourseID, item,
+				fmt.Sprintf("course %d referenced by the version no longer exists; update the timetable before publishing", item.CourseID)))
+		}
+		if _, ok := slotMap[item.TimeSlotID]; !ok {
+			conflicts = append(conflicts, missingReferenceConflict("time_slot", item.TimeSlotID, item,
+				fmt.Sprintf("time slot %d referenced by the version no longer exists; update the timetable before publishing", item.TimeSlotID)))
+		}
+
 		slotKey := fmt.Sprintf("%d-%d-%d", item.Week, item.DayOfWeek, item.TimeSlotID)
 		teacherKey := slotKey + "-t-" + fmt.Sprint(item.TeacherID)
 		classKey := slotKey + "-c-" + fmt.Sprint(item.ClassID)
 		classroomKey := slotKey + "-r-" + fmt.Sprint(item.ClassroomID)
 		if existing, ok := teacherSlots[teacherKey]; ok && existing != idx {
+			teacher := teacherMap[item.TeacherID]
 			conflicts = append(conflicts, dto.ConflictResponse{
 				Type: constants.ConflictTeacherTime, EntityType: "teacher", EntityID: item.TeacherID,
-				EntityName: teacherMap[item.TeacherID].Name, Week: item.Week, DayOfWeek: item.DayOfWeek, TimeSlotID: item.TimeSlotID,
+				EntityName: teacher.Name, Week: item.Week, DayOfWeek: item.DayOfWeek, TimeSlotID: item.TimeSlotID,
 				Suggestion: fmt.Sprintf("teacher already has a lesson at week %d day %d slot %d; move one of the lessons", item.Week, item.DayOfWeek, item.TimeSlotID),
 			})
 		}
 		if existing, ok := classSlots[classKey]; ok && existing != idx {
+			class := classMap[item.ClassID]
 			conflicts = append(conflicts, dto.ConflictResponse{
 				Type: constants.ConflictClassTime, EntityType: "class", EntityID: item.ClassID,
-				EntityName: classMap[item.ClassID].Name, Week: item.Week, DayOfWeek: item.DayOfWeek, TimeSlotID: item.TimeSlotID,
+				EntityName: class.Name, Week: item.Week, DayOfWeek: item.DayOfWeek, TimeSlotID: item.TimeSlotID,
 				Suggestion: fmt.Sprintf("class already has a lesson at week %d day %d slot %d; move one of the lessons", item.Week, item.DayOfWeek, item.TimeSlotID),
 			})
 		}
 		if existing, ok := classroomSlots[classroomKey]; ok && existing != idx {
+			classroom := classroomMap[item.ClassroomID]
 			conflicts = append(conflicts, dto.ConflictResponse{
 				Type: constants.ConflictClassroomTime, EntityType: "classroom", EntityID: item.ClassroomID,
-				EntityName: classroomMap[item.ClassroomID].Name, Week: item.Week, DayOfWeek: item.DayOfWeek, TimeSlotID: item.TimeSlotID,
+				EntityName: classroom.Name, Week: item.Week, DayOfWeek: item.DayOfWeek, TimeSlotID: item.TimeSlotID,
 				Suggestion: fmt.Sprintf("classroom already has a lesson at week %d day %d slot %d; move one of the lessons", item.Week, item.DayOfWeek, item.TimeSlotID),
 			})
 		}
@@ -325,4 +359,16 @@ func (p *planner) DetectConflicts(ctx context.Context, items []model.Schedule) [
 		classroomSlots[classroomKey] = idx
 	}
 	return conflicts
+}
+
+func missingReferenceConflict(entityType string, entityID uint, item model.Schedule, suggestion string) dto.ConflictResponse {
+	return dto.ConflictResponse{
+		Type:       constants.ConflictReferenceMissing,
+		EntityType: entityType,
+		EntityID:   entityID,
+		Week:       item.Week,
+		DayOfWeek:  item.DayOfWeek,
+		TimeSlotID: item.TimeSlotID,
+		Suggestion: suggestion,
+	}
 }

@@ -356,6 +356,20 @@ func (s *versionService) Rollback(ctx context.Context, planID, versionID uint, r
 		return nil, fmt.Errorf("decode snapshot: %w", err)
 	}
 
+	// Re-check conflicts against current master data before the rollback can
+	// overwrite the live timetable. A previously valid release may have become
+	// unusable after classroom capacity changes, teacher preference updates or
+	// deletion of referenced master data — in that case the rollback is
+	// rejected with the concrete conflicts, exactly like publishing a draft.
+	conflicts := s.planner.DetectConflicts(ctx, toModelSchedules(lessons))
+	if len(conflicts) > 0 {
+		err := ConflictWithData(fmt.Sprintf("rollback rejected: %d conflict(s) found in published version %d (%s) against current master data, resolve them before rolling back", len(conflicts), source.ID, source.Name),
+			map[string]any{"conflict_count": len(conflicts), "conflicts": conflicts})
+		_ = s.recordLog(ctx, planID, source.ID, constants.ActionVersionReject, req.Operator,
+			map[string]any{"operation": "rollback", "reason": err.Error(), "conflict_count": len(conflicts)})
+		return nil, err
+	}
+
 	rollbackName := req.Name
 	if strings.TrimSpace(rollbackName) == "" {
 		rollbackName = fmt.Sprintf("回滚至 v%d - %s", source.VersionNo, source.Name)
