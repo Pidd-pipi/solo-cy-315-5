@@ -21,6 +21,7 @@ type Handlers struct {
 	TimeSlot   *handler.TimeSlotHandler
 	Schedule   *handler.ScheduleHandler
 	Statistics *handler.StatisticsHandler
+	Version    *handler.VersionHandler
 }
 
 // New constructs the Gin engine with all routes and middleware.
@@ -94,6 +95,19 @@ func New(h Handlers, logger *slog.Logger) *gin.Engine {
 			statistics.GET("/classrooms", h.Statistics.ClassroomUtilization)
 			statistics.GET("/teachers", h.Statistics.TeacherWorkload)
 			statistics.GET("/density", h.Statistics.CourseDensity)
+		}
+		plans := api.Group("/plans")
+		{
+			plans.GET("", h.Version.ListPlans)
+			plans.POST("", h.Version.CreatePlan)
+			plans.GET("/:plan_id", h.Version.GetPlan)
+			plans.GET("/:plan_id/operation-logs", h.Version.OperationLogs)
+			plans.POST("/:plan_id/versions/drafts", h.Version.CreateDraft)
+			plans.GET("/:plan_id/versions", h.Version.ListVersions)
+			plans.POST("/:plan_id/versions/compare", h.Version.Compare)
+			plans.GET("/:plan_id/versions/:version_id", h.Version.GetVersion)
+			plans.POST("/:plan_id/versions/:version_id/publish", h.Version.Publish)
+			plans.POST("/:plan_id/versions/:version_id/rollback", h.Version.Rollback)
 		}
 	}
 	return engine

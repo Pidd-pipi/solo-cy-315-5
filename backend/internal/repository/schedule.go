@@ -25,6 +25,8 @@ type ScheduleRepository interface {
 	DeleteByID(ctx context.Context, id uint) error
 	DeleteByWeeks(ctx context.Context, weeks []uint) error
 	DeleteAll(ctx context.Context) error
+	// ReplaceAllTx clears every live lesson and inserts items within one tx.
+	ReplaceAllTx(ctx context.Context, tx *gorm.DB, items []model.Schedule) (int64, error)
 }
 
 type scheduleRepository struct {
@@ -104,4 +106,16 @@ func (r *scheduleRepository) DeleteAll(ctx context.Context) error {
 		return fmt.Errorf("delete all schedules: %w", err)
 	}
 	return nil
+}
+
+func (r *scheduleRepository) ReplaceAllTx(ctx context.Context, tx *gorm.DB, items []model.Schedule) (int64, error) {
+	if err := tx.WithContext(ctx).Where("1 = 1").Delete(&model.Schedule{}).Error; err != nil {
+		return 0, fmt.Errorf("clear schedules: %w", err)
+	}
+	if len(items) > 0 {
+		if err := tx.WithContext(ctx).CreateInBatches(items, 200).Error; err != nil {
+			return 0, fmt.Errorf("insert schedules: %w", err)
+		}
+	}
+	return int64(len(items)), nil
 }

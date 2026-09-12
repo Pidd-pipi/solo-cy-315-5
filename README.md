@@ -9,6 +9,7 @@
 - **冲突检测与报告**：检测教师时间冲突、班级时间冲突、教室时间冲突、教室容量冲突和教师偏好冲突，并给出解决建议。
 - **课表查询与导出**：按班级、教师、教室查询课表，支持 JSON / CSV 导出，支持按周次查看。
 - **调课与手动调整**：支持交换两节课、移动单节课到空闲时段，自动重新检测冲突并记录调课历史。
+- **方案版本管理**：每次排课生成带名称的草稿，支持版本列表/详情、同方案两版本差异比较、发布（发布前复检冲突，冲突拒绝并说明原因）、回滚到已发布版本；重复发布、跨方案比较/回滚、回滚草稿均被拒绝，全部操作记录执行人与时间。
 - **统计与利用率分析**：教室利用率、教师工作量、课程分布热力图数据。
 
 ## API 文档
@@ -67,6 +68,16 @@ go run ./cmd/server
 | GET | `/api/v1/statistics/classrooms` | 教室利用率 |
 | GET | `/api/v1/statistics/teachers` | 教师工作量 |
 | GET | `/api/v1/statistics/density` | 课程分布热力图 |
+| POST | `/api/v1/plans` | 新建排课方案（`operator` 记录执行人） |
+| GET | `/api/v1/plans` | 方案列表 |
+| GET | `/api/v1/plans/:plan_id` | 方案详情 |
+| POST | `/api/v1/plans/:plan_id/versions/drafts` | 排课并生成带名称草稿（只存快照，不影响线上课表） |
+| GET | `/api/v1/plans/:plan_id/versions` | 版本列表 |
+| GET | `/api/v1/plans/:plan_id/versions/:version_id` | 版本详情（含课表快照） |
+| POST | `/api/v1/plans/:plan_id/versions/compare` | 比较同方案两个版本（added/removed/modified） |
+| POST | `/api/v1/plans/:plan_id/versions/:version_id/publish` | 发布草稿（发布前复检冲突，有冲突返回 409 和明细） |
+| POST | `/api/v1/plans/:plan_id/versions/:version_id/rollback` | 回滚到指定已发布版本（生成新的已发布版本） |
+| GET | `/api/v1/plans/:plan_id/operation-logs` | 版本操作审计（动作/执行人/时间，含被拒绝操作） |
 
 统一响应格式：
 

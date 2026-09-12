@@ -24,6 +24,20 @@ func Created(c *gin.Context, data any) {
 
 // Error converts a service error to a unified JSON response.
 func Error(c *gin.Context, err error) {
+	var bizErr *service.BusinessError
+	if errors.As(err, &bizErr) {
+		switch {
+		case errors.Is(err, service.ErrNotFound):
+			c.JSON(http.StatusNotFound, dto.Response{Code: constants.CodeNotFound, Message: bizErr.Message, Data: bizErr.Data})
+		case errors.Is(err, service.ErrInvalid):
+			c.JSON(http.StatusBadRequest, dto.Response{Code: constants.CodeBadRequest, Message: bizErr.Message, Data: bizErr.Data})
+		case errors.Is(err, service.ErrConflict):
+			c.JSON(http.StatusConflict, dto.Response{Code: constants.CodeConflict, Message: bizErr.Message, Data: bizErr.Data})
+		default:
+			c.JSON(http.StatusInternalServerError, dto.Response{Code: constants.CodeInternal, Message: bizErr.Message, Data: bizErr.Data})
+		}
+		return
+	}
 	switch {
 	case errors.Is(err, service.ErrNotFound):
 		c.JSON(http.StatusNotFound, dto.Response{Code: constants.CodeNotFound, Message: constants.MsgNotFound, Data: nil})
